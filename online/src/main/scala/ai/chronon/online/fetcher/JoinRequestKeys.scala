@@ -65,9 +65,32 @@ private[online] object JoinRequestKeys {
         if (keysToDerive.isEmpty) {
           Map.empty[String, Any]
         } else {
-          val derivedValues = catalystUtil
-            .map(_.performSql(request.keys).headOption.getOrElse(Map.empty))
-            .getOrElse(Map.empty)
+          // Input types are inferred, so mismatched caller values fail deep in Catalyst encoding -
+          // surface expected-vs-actual here instead.
+          val derivedValues =
+            try {
+              catalystUtil
+                .map(_.performSql(request.keys).headOption.getOrElse(Map.empty))
+                .getOrElse(Map.empty)
+            } catch {
+              case e: Exception =>
+                val expectedVsActual = requestKeyFields
+                  .map { field =>
+                    val actual = request.keys.get(field.name) match {
+                      case Some(null) => "null"
+                      case Some(value) => value.getClass.getName
+                      case None => "<missing>"
+                    }
+                    s"${field.name}: expected ${field.fieldType}, got $actual"
+                  }
+                  .mkString("; ")
+                throw new IllegalArgumentException(
+                  s"Failed to derive left keys [${keysToDerive.map { case (k, expr) => s"$k=$expr" }.mkString(", ")}] " +
+                    s"for join ${request.name}. Request key types may not match the inferred input schema " +
+                    s"($expectedVsActual)",
+                  e
+                )
+            }
           keysToDerive.map { case (leftKey, _) =>
             leftKey -> derivedValues.getOrElse(leftKey, null)
           }.toMap
@@ -110,18 +133,42 @@ private[online] object JoinRequestKeys {
   private def selectExpression(join: Join, leftKey: String): Option[String] =
     leftSelects(join).get(leftKey).filter(_ != leftKey)
 
-  private[fetcher] def rawInputs(expression: String): Seq[String] =
+  private[fetcher] def rawInputPaths(expression: String): Seq[Seq[String]] =
     CatalystSqlParser
       .parseExpression(expression)
       .collect { case attr: UnresolvedAttribute =>
-        attr.nameParts.head
+        attr.nameParts
       }
       .distinct
 
+  private[fetcher] def rawInputs(expression: String): Seq[String] =
+    rawInputPaths(expression).map(_.head).distinct
+
   private def rawInputType(servingInfo: GroupByServingInfoParsed,
                            requestKey: String,
-                           fallbackType: DataType): DataType =
-    Try(servingInfo.inputChrononSchema.typeOf(requestKey)).toOption.flatten.getOrElse(fallbackType)
+                           pathTypes: Seq[(Seq[String], DataType)]): DataType =
+    Try(servingInfo.inputChrononSchema.typeOf(requestKey)).toOption.flatten.getOrElse {
+      val nested = pathTypes.filter { case (path, _) => path.nonEmpty }
+      if (nested.isEmpty) pathTypes.head._2
+      else syntheticStructType(requestKey, nested)
+    }
+
+  // Left-source struct columns are invisible to the GroupBy input schema; leaf types fall back to
+  // the mapped right key's type.
+  private def syntheticStructType(name: String, pathTypes: Seq[(Seq[String], DataType)]): StructType = {
+    val pathTypesByField = mutable.LinkedHashMap.empty[String, mutable.ArrayBuffer[(Seq[String], DataType)]]
+    pathTypes.foreach { case (path, leafType) =>
+      pathTypesByField.getOrElseUpdate(path.head, mutable.ArrayBuffer.empty) += (path.tail -> leafType)
+    }
+    val fields = pathTypesByField.map { case (fieldName, fieldPathTypes) =>
+      val nested = fieldPathTypes.filter { case (path, _) => path.nonEmpty }
+      val fieldType =
+        if (nested.isEmpty) fieldPathTypes.head._2
+        else syntheticStructType(s"${name}_$fieldName", nested.toSeq)
+      StructField(fieldName, fieldType)
+    }.toArray
+    StructType(name, fields)
+  }
 
   def valueInfoLeftKeys(join: Join, joinPart: JoinPartOps): Iterable[String] =
     joinPart.leftToRight.keys.toSeq.flatMap { leftKey =>
@@ -131,13 +178,12 @@ private[online] object JoinRequestKeys {
   private def requestKeyFields(join: Join,
                                joinPart: JoinPartOps,
                                servingInfo: GroupByServingInfoParsed,
-                               rawInputsByLeftKey: Map[String, Seq[String]]): Iterable[StructField] = {
+                               rawInputPathsByLeftKey: Map[String, Seq[Seq[String]]]): Iterable[StructField] = {
     val keySchema = servingInfo.keyCodec.chrononSchema.asInstanceOf[StructType]
     val fieldsByRightKey = keySchema.fields.map(field => field.name -> field).toMap
-    val fieldsByRequestKey = mutable.LinkedHashMap.empty[String, StructField]
 
-    joinPart.leftToRight.foreach { case (leftKey, rightKey) =>
-      val fieldType = fieldsByRightKey
+    def rightKeyType(leftKey: String, rightKey: String): DataType =
+      fieldsByRightKey
         .getOrElse(
           rightKey,
           throw new IllegalArgumentException(
@@ -145,10 +191,24 @@ private[online] object JoinRequestKeys {
               s"but $rightKey is not present in GroupBy key schema ${keySchema.fields.map(_.name).mkString(", ")}")
         )
         .fieldType
-      val requestKeys = rawInputsByLeftKey.getOrElse(leftKey, Seq(leftKey))
-      requestKeys.foreach { requestKey =>
+
+    val pathTypesByRequestKey = mutable.LinkedHashMap.empty[String, mutable.ArrayBuffer[(Seq[String], DataType)]]
+    joinPart.leftToRight.foreach { case (leftKey, rightKey) =>
+      val fieldType = rightKeyType(leftKey, rightKey)
+      rawInputPathsByLeftKey.getOrElse(leftKey, Seq(Seq(leftKey))).foreach { path =>
+        pathTypesByRequestKey.getOrElseUpdate(path.head, mutable.ArrayBuffer.empty) += (path.tail -> fieldType)
+      }
+    }
+
+    val fieldsByRequestKey = mutable.LinkedHashMap.empty[String, StructField]
+    joinPart.leftToRight.foreach { case (leftKey, rightKey) =>
+      val fieldType = rightKeyType(leftKey, rightKey)
+      rawInputPathsByLeftKey.getOrElse(leftKey, Seq(Seq(leftKey))).foreach { path =>
+        val requestKey = path.head
         if (!fieldsByRequestKey.contains(requestKey)) {
-          fieldsByRequestKey.put(requestKey, StructField(requestKey, rawInputType(servingInfo, requestKey, fieldType)))
+          fieldsByRequestKey.put(
+            requestKey,
+            StructField(requestKey, rawInputType(servingInfo, requestKey, pathTypesByRequestKey(requestKey).toSeq)))
         }
       }
       if (!fieldsByRequestKey.contains(leftKey)) {
@@ -171,7 +231,15 @@ private[online] object JoinRequestKeys {
         }
         .getOrElse(Seq(leftKey))
     }.toMap
-    val keyFields = requestKeyFields(join, joinPart, servingInfo, rawInputsByLeftKey)
+    val rawInputPathsByLeftKey = joinPart.leftToRight.keys.map { leftKey =>
+      leftKey -> selectedLeftKeys
+        .find(_._1 == leftKey)
+        .map { case (_, expression) =>
+          rawInputPaths(expression)
+        }
+        .getOrElse(Seq(Seq(leftKey)))
+    }.toMap
+    val keyFields = requestKeyFields(join, joinPart, servingInfo, rawInputPathsByLeftKey)
     val catalystUtil =
       if (selectedLeftKeys.isEmpty) None
       else

@@ -32,11 +32,15 @@ class JoinRequestKeysTest extends AnyFlatSpec {
         ))
     )
 
-  private def servingInfo(inputSchema: StructType): GroupByServingInfoParsed = {
+  private def servingInfo(inputSchema: StructType): GroupByServingInfoParsed =
+    servingInfo(groupBy, StructType("Key", Array(StructField("query_normalized", StringType))), inputSchema)
+
+  private def servingInfo(groupBy: GroupBy,
+                          keySchema: StructType,
+                          inputSchema: StructType): GroupByServingInfoParsed = {
     val groupByServingInfo = new GroupByServingInfo()
     groupByServingInfo.setGroupBy(groupBy)
-    groupByServingInfo.setKeyAvroSchema(
-      AvroConversions.fromChrononSchema(StructType("Key", Array(StructField("query_normalized", StringType)))).toString)
+    groupByServingInfo.setKeyAvroSchema(AvroConversions.fromChrononSchema(keySchema).toString)
     groupByServingInfo.setInputAvroSchema(AvroConversions.fromChrononSchema(inputSchema).toString)
     new GroupByServingInfoParsed(groupByServingInfo)
   }
@@ -115,6 +119,47 @@ class JoinRequestKeysTest extends AnyFlatSpec {
         queryJoin,
         joinPart)
     )
+  }
+
+  it should "derive GroupBy keys from struct-extracting select expressions" in {
+    val testGroupBy = Builders.GroupBy(
+      metaData = Builders.MetaData(name = "unit_test.test_group_by"),
+      keyColumns = Seq("test_id")
+    )
+    val testJoin = Builders.Join(
+      metaData = Builders.MetaData(name = "unit_test.test_join"),
+      left = Builders.Source.events(
+        query = Builders.Query(selects = Map("test_id" -> "CAST(data.testId AS BIGINT)")),
+        table = "unit_test.test_events"
+      ),
+      joinParts = Seq(
+        Builders.JoinPart(
+          groupBy = testGroupBy,
+          keyMapping = Map("testId" -> "test_id")
+        ))
+    )
+    val joinPart = testJoin.joinPartOps.head
+
+    val keyServingInfo = servingInfo(
+      testGroupBy,
+      StructType("Key", Array(StructField("test_id", LongType))),
+      StructType("Input", Array(StructField("test_id", LongType)))
+    )
+    val request = Request(testJoin.metaData.name, Map("data" -> Map("testId" -> 123L)))
+
+    assertEquals(
+      Map("test_id" -> 123L),
+      JoinRequestKeys.deriveLeftKeys(request, testJoin, joinPart, keyServingInfo)
+    )
+
+    // Wrong-shaped value: scalar where the inferred schema expects a struct.
+    val badRequest = Request(testJoin.metaData.name, Map("data" -> "not-a-struct"))
+    val thrown = intercept[IllegalArgumentException] {
+      JoinRequestKeys.deriveLeftKeys(badRequest, testJoin, joinPart, keyServingInfo)
+    }
+    assert(thrown.getMessage.contains("test_id=CAST(data.testId AS BIGINT)"))
+    assert(thrown.getMessage.contains("data: expected"))
+    assert(thrown.getMessage.contains("got java.lang.String"))
   }
 
   it should "derive GroupBy keys from raw request keys" in {

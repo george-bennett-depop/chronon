@@ -77,9 +77,9 @@ private[online] object JoinRequestKeys {
                 val expectedVsActual = requestKeyFields
                   .map { field =>
                     val actual = request.keys.get(field.name) match {
-                      case Some(null) => "null"
+                      case Some(null)  => "null"
                       case Some(value) => value.getClass.getName
-                      case None => "<missing>"
+                      case None        => "<missing>"
                     }
                     s"${field.name}: expected ${field.fieldType}, got $actual"
                   }

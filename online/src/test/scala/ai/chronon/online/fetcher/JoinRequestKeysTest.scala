@@ -132,11 +132,7 @@ class JoinRequestKeysTest extends AnyFlatSpec {
         query = Builders.Query(selects = Map("test_id" -> "CAST(data.testId AS BIGINT)")),
         table = "unit_test.test_events"
       ),
-      joinParts = Seq(
-        Builders.JoinPart(
-          groupBy = testGroupBy,
-          keyMapping = Map("testId" -> "test_id")
-        ))
+      joinParts = Seq(Builders.JoinPart(groupBy = testGroupBy))
     )
     val joinPart = testJoin.joinPartOps.head
 
